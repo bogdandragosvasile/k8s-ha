@@ -7,7 +7,6 @@ install:
 	sudo apt update && sudo apt install vagrant && \
 	vagrant plugin install vagrant-libvirt vagrant-vbguest && \
 	sudo apt install software-properties-common && \
-    sudo apt-add-repository --yes --update ppa:ansible/ansible && \
     sudo apt install ansible python3-passlib
 
 # Provision Virtual Machines
