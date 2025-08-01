@@ -1,33 +1,24 @@
-name: Kubernetes HA Cluster Management
+name: Kubernetes HA Cluster Setup
 
 on:
   workflow_dispatch:
-    inputs:
-      action:
-        description: 'Action to perform: create, start, stop, or destroy'
-        required: true
-        type: choice
-        options:
-          - create
-          - start
-          - stop
-          - destroy
+  push:
+    branches:
+      - main
 
 jobs:
-  manage-k8s-ha:
+  setup-k8s-ha:
     runs-on: self-hosted
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Update and upgrade packages (for create)
-        if: github.event.inputs.action == 'create'
+      - name: Update and upgrade packages
         run: |
           sudo apt update
           sudo apt upgrade -y
 
-      - name: Install virtualization dependencies if not present (for create)
-        if: github.event.inputs.action == 'create'
+      - name: Install virtualization dependencies if not present
         run: |
           PACKAGES="bridge-utils qemu-kvm virtinst libvirt-dev libvirt-daemon virt-manager"
           TO_INSTALL=""
@@ -42,12 +33,10 @@ jobs:
             echo "Virtualization dependencies already installed. Skipping."
           fi
 
-      - name: Check KVM support (for create)
-        if: github.event.inputs.action == 'create'
+      - name: Check KVM support
         run: kvm-ok
 
-      - name: Install Vagrant if not present (for create, start, stop, destroy)
-        if: github.event.inputs.action != 'stop'
+      - name: Install Vagrant if not present
         run: |
           if ! command -v vagrant &> /dev/null; then
             wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
@@ -59,8 +48,7 @@ jobs:
             echo "Vagrant already installed. Skipping."
           fi
 
-      - name: Install Ansible if not present (for create)
-        if: github.event.inputs.action == 'create'
+      - name: Install Ansible if not present
         run: |
           if ! command -v ansible &> /dev/null; then
             sudo apt install -y software-properties-common
@@ -70,8 +58,7 @@ jobs:
             echo "Ansible already installed. Skipping."
           fi
 
-      - name: Generate SSH keys if not present (for create)
-        if: github.event.inputs.action == 'create'
+      - name: Generate SSH keys if not present
         run: |
           if [ ! -f ansible/vagrant ] || [ ! -f ansible/vagrant.pub ]; then
             ssh-keygen -t rsa -b 4096 -f ansible/vagrant -N ""
@@ -81,16 +68,13 @@ jobs:
             echo "SSH keys already exist. Skipping generation."
           fi
 
-      - name: Run make install (for create)
-        if: github.event.inputs.action == 'create'
+      - name: Run make install
         run: make install
 
-      - name: Run make up (provision VMs - for create or start)
-        if: github.event.inputs.action == 'create' || github.event.inputs.action == 'start'
+      - name: Run make up (provision VMs)
         run: make up
 
-      - name: Clear known hosts (if necessary - for create)
-        if: github.event.inputs.action == 'create'
+      - name: Clear known hosts (if necessary)
         run: |
           ssh-keygen -f $HOME/.ssh/known_hosts -R 172.16.16.51 || true
           ssh-keygen -f $HOME/.ssh/known_hosts -R 172.16.16.52 || true
@@ -101,12 +85,10 @@ jobs:
           ssh-keygen -f $HOME/.ssh/known_hosts -R 172.16.16.202 || true
           ssh-keygen -f $HOME/.ssh/known_hosts -R 172.16.16.203 || true
 
-      - name: Run make cluster (setup Kubernetes cluster - for create)
-        if: github.event.inputs.action == 'create'
+      - name: Run make cluster (setup Kubernetes cluster)
         run: make cluster
 
-       - name: Install kubectl if not present (for create)
-        if: github.event.inputs.action == 'create'
+      - name: Install kubectl if not present
         run: |
           if ! command -v kubectl &> /dev/null; then
             curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
@@ -115,104 +97,20 @@ jobs:
             echo "kubectl already installed. Skipping."
           fi
 
-      - name: Verify cluster (for create)
-        if: github.event.inputs.action == 'create'
+      - name: Verify cluster
         run: |
           kubectl cluster-info
           kubectl get nodes
 
-      - name: Install Helm if not present (for create)
-        if: github.event.inputs.action == 'create'
-        run: |
-          if ! command -v helm &> /dev/null; then
-            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-          else
-            echo "Helm already installed. Skipping."
-          fi
-
-      - name: Install Cert-Manager if not present (for create)
-        if: github.event.inputs.action == 'create'
-        run: |
-          if ! kubectl get namespace cert-manager &> /dev/null; then
-            helm repo add jetstack https://charts.jetstack.io --force-update
-            helm repo update
-            helm install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --set installCRDs=true
-          else
-            echo "Cert-Manager already installed. Skipping."
-          fi
-
-      - name: Configure Let's Encrypt ClusterIssuer (for create)
-        if: github.event.inputs.action == 'create'
-        run: |
-          cat <<EOF | kubectl apply -f -
-          apiVersion: cert-manager.io/v1
-          kind: ClusterIssuer
-          metadata:
-            name: letsencrypt-production
-          spec:
-            acme:
-              server: https://acme-v02.api.letsencrypt.org/directory
-              email: your-email@example.com  # Replace with your actual email
-              privateKeySecretRef:
-                name: letsencrypt-production
-              solvers:
-                - http01:
-                    ingress:
-                      class: nginx  # Adjust if using a different ingress class
-          EOF
-
-      - name: Install HashiCorp Vault if not present (for create)
-        if: github.event.inputs.action == 'create'
-        run: |
-          if ! kubectl get namespace vault &> /dev/null; then
-            helm repo add hashicorp https://helm.releases.hashicorp.com --force-update
-            helm repo update
-            helm install vault hashicorp/vault --namespace vault --create-namespace --set "server.dev.enabled=true"
-            kubectl exec -n vault -it vault-0 -- vault operator init -key-shares=1 -key-threshold=1
-            kubectl exec -n vault -it vault-0 -- vault operator unseal $(kubectl exec -n vault -it vault-0 -- vault operator init -format=json | jq -r '.unseal_keys_b64[0]')
-          else
-            echo "Vault already installed. Skipping."
-          fi
-
-      - name: Install ArgoCD if not present (for create)
-        if: github.event.inputs.action == 'create'
-        run: |
-          if ! kubectl get namespace argocd &> /dev/null; then
-            kubectl create namespace argocd
-            kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-            kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
-          else
-            echo "ArgoCD already installed. Skipping."
-          fi
-
-      - name: Configure SSO for ArgoCD (GitHub example - for create)
-        if: github.event.inputs.action == 'create'
-        run: |
-          kubectl patch configmap argocd-cm -n argocd --type merge -p '{
-            "data": {
-              "url": "https://argocd.example.com",  # Replace with your ArgoCD URL
-              "dex.config": "connectors:\n- type: github\n  id: github\n  name: GitHub\n  config:\n    clientID: $GITHUB_CLIENT_ID  # Set as GitHub secret or env var\n    clientSecret: $GITHUB_CLIENT_SECRET  # Set as GitHub secret or env var\n    orgs:\n    - name: your-github-org"
-            }
-          }'
-
-      - name: Deploy test nginx (for create)
-        if: github.event.inputs.action == 'create'
+      - name: Deploy test nginx
         run: |
           kubectl create deployment nginx-deployment --image=cgr.dev/chainguard/nginx:latest
           kubectl expose deployment nginx-deployment --port=8080 --target-port=80
           kubectl get pods -o wide
           kubectl get services
 
-      - name: Stop cluster (for stop)
-        if: github.event.inputs.action == 'stop'
-        run: vagrant halt
-
-      - name: Destroy cluster (for destroy)
-        if: github.event.inputs.action == 'destroy'
-        run: vagrant destroy -f
-
-      - name: Cleanup test deployment (for create)
-        if: always() && github.event.inputs.action == 'create'
+      - name: Cleanup test deployment
+        if: always()
         run: |
           kubectl delete service nginx-deployment || true
           kubectl delete deployment nginx-deployment || true
