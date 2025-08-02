@@ -1,0 +1,155 @@
+name: Deploy Cluster Apps to Local Kubernetes
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: self-hosted  # Targets your Ubuntu 25.04 self-hosted runner
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Add Helm Repos
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo add hashicorp https://helm.releases.hashicorp.com
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm repo update
+
+      - name: Deploy PostgreSQL (for Keycloak)
+        run: |
+          helm install keycloak-db bitnami/postgresql \
+            --set auth.postgresPassword=${{ secrets.DB_PASSWORD }} \
+            --set auth.database=keycloak \
+            --namespace keycloak --create-namespace
+
+      - name: Deploy Keycloak
+        run: |
+          helm install keycloak bitnami/keycloak \
+            --set auth.adminUser=admin \
+            --set auth.adminPassword=${{ secrets.ADMIN_PASSWORD }} \
+            --set postgresql.enabled=false \
+            --set externalDatabase.host=keycloak-db-postgresql.keycloak.svc.cluster.local \
+            --set externalDatabase.password=${{ secrets.DB_PASSWORD }} \
+            --set externalDatabase.database=keycloak \
+            --namespace keycloak
+
+      - name: Deploy Vault (for Secrets Storage)
+        run: |
+          helm install vault hashicorp/vault \
+            --set "server.dev.enabled=false" \
+            --set "server.ha.enabled=true" \
+            --set "server.ha.raft.enabled=true" \
+            --set "server.ha.replicas=3" \
+            --namespace vault --create-namespace
+
+      - name: Deploy Cert-Manager
+        run: |
+          helm install cert-manager jetstack/cert-manager \
+            --set installCRDs=true \
+            --namespace cert-manager --create-namespace
+
+      - name: Set Up Let's Encrypt Issuer
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-staging
+          spec:
+            acme:
+              server: https://acme-staging-v02.api.letsencrypt.org/directory
+              email: your-email@example.com
+              privateKeySecretRef:
+                name: letsencrypt-staging
+              solvers:
+                - http01:
+                    ingress:
+                      class: nginx
+          EOF
+          # Switch to production issuer after testing: Replace server with https://acme-v02.api.letsencrypt.org/directory
+
+      - name: Deploy Argo CD
+        run: |
+          helm install argocd argo/argo-cd \
+            --namespace argocd --create-namespace
+
+      - name: Configure Argo CD SSO with Keycloak
+        run: |
+          kubectl patch configmap argocd-cm -n argocd --type merge -p '{
+            "data": {
+              "oidc.config": "name: Keycloak\nissuer: http://keycloak.yourdomain.com/realms/argocd-realm\nclientID: argocd-client\nclientSecret: ${{ secrets.KEYCLOAK_CLIENT_SECRET }}\nrequestedScopes: [openid, profile, email, groups]"
+            }
+          }'
+          kubectl rollout restart deployment argocd-server -n argocd
+
+      - name: Apply Ingress for Keycloak with SSL/TLS
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: keycloak-ingress
+            namespace: keycloak
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-staging
+              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - keycloak.yourdomain.com
+                secretName: keycloak-tls
+            rules:
+              - host: keycloak.yourdomain.com
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: keycloak
+                          port:
+                            number: 80
+          EOF
+
+      - name: Apply Ingress for Argo CD with SSL/TLS and SSO
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: argocd-ingress
+            namespace: argocd
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-staging
+              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - argocd.yourdomain.com
+                secretName: argocd-tls
+            rules:
+              - host: argocd.yourdomain.com
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: argocd-server
+                          port:
+                            number: 80
+          EOF
+
+      - name: Verify Deployments
+        run: kubectl get pods --all-namespaces
